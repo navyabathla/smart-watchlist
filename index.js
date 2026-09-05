@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
+const { getQuote } = require('./finnhub');
 
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -243,6 +244,37 @@ app.get('/watchlist/changes', requireAuth, async (req, res) => {
     res.status(500).json({ error: 'Failed to compute changes' });
   }
 });
+// --- In-process price polling (merged from worker.js — see README for why) ---
+const POLL_INTERVAL_MS = 60 * 1000;
+
+async function getWatchedSymbols() {
+  const result = await pool.query('SELECT DISTINCT symbol FROM watchlist_items');
+  return result.rows.map((row) => row.symbol);
+}
+
+async function pollOnce() {
+  const symbols = await getWatchedSymbols();
+  if (symbols.length === 0) return;
+
+  for (const symbol of symbols) {
+    try {
+      const quote = await getQuote(symbol);
+      if (quote.price == null) continue;
+      await pool.query(
+        'INSERT INTO price_snapshots (symbol, price) VALUES ($1, $2)',
+        [symbol, quote.price]
+      );
+      console.log(`Stored ${symbol}: $${quote.price}`);
+    } catch (err) {
+      console.error(`Failed to fetch/store ${symbol}:`, err.message);
+    }
+  }
+}
+
+console.log('Starting in-process price poller');
+pollOnce();
+setInterval(pollOnce, POLL_INTERVAL_MS);
+// --- end polling logic ---
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
