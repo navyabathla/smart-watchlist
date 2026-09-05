@@ -1,0 +1,22 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb-ha:pg18
+    container_name: watchlist-db
+    restart: always
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: watchlist
+    volumes:
+      - timescale_data:/home/postgres/pgdata/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: watchlist-redis
+    restart: always
+    ports:
+      - "6379:6379"
+
+volumes:
+  timescale_data:

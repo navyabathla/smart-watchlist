@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Smart Market Watchlist</title>
+  <style>
+    body { font-family: sans-serif; max-width: 700px; margin: 40px auto; background: #0f172a; color: #e2e8f0; }
+    h1 { font-size: 1.4rem; }
+    .row { display: flex; justify-content: space-between; align-items: center; padding: 12px; margin-bottom: 8px; border-radius: 8px; background: #1e293b; }
+    .row.meaningful { border-left: 4px solid #f59e0b; background: #292215; }
+    .symbol { font-weight: bold; font-size: 1.1rem; }
+    .price { font-family: monospace; }
+    .up { color: #4ade80; }
+    .down { color: #f87171; }
+    .reason { font-size: 0.8rem; color: #94a3b8; }
+    input, button { padding: 8px; margin-right: 6px; border-radius: 4px; border: 1px solid #334155; background: #1e293b; color: #e2e8f0; }
+    button { cursor: pointer; }
+    #authBox { max-width: 320px; }
+    #authError { color: #f87171; font-size: 0.85rem; margin-top: 8px; }
+    #topBar { display: flex; justify-content: space-between; align-items: center; }
+  </style>
+</head>
+<body>
+
+  <div id="authBox">
+    <h1>Smart Market Watchlist</h1>
+    <input id="emailInput" placeholder="email" /><br /><br />
+    <input id="passwordInput" type="password" placeholder="password" /><br /><br />
+    <button onclick="signup()">Sign up</button>
+    <button onclick="login()">Log in</button>
+    <div id="authError"></div>
+  </div>
+
+  <div id="appBox" style="display:none;">
+    <div id="topBar">
+      <h1>Smart Market Watchlist</h1>
+      <button onclick="logout()">Log out</button>
+    </div>
+
+    <div>
+      <input id="symbolInput" placeholder="e.g. GOOGL" />
+      <button onclick="addSymbol()">Add</button>
+    </div>
+
+    <div id="list" style="margin-top: 20px;"></div>
+  </div>
+
+  <script>
+    let TOKEN = localStorage.getItem('token');
+
+    function showApp() {
+      document.getElementById('authBox').style.display = 'none';
+      document.getElementById('appBox').style.display = 'block';
+      loadChanges(true);
+      setInterval(() => loadChanges(false), 15000);
+    }
+
+    // If a token is already saved from a previous visit, skip straight to the app
+    if (TOKEN) showApp();
+
+    async function signup() {
+      await authRequest('/auth/signup');
+    }
+
+    async function login() {
+      await authRequest('/auth/login');
+    }
+
+    async function authRequest(path) {
+      const email = document.getElementById('emailInput').value.trim();
+      const password = document.getElementById('passwordInput').value;
+      const errorBox = document.getElementById('authError');
+      errorBox.textContent = '';
+
+      try {
+        const res = await fetch(path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          errorBox.textContent = data.error || 'Something went wrong';
+          return;
+        }
+        TOKEN = data.token;
+        localStorage.setItem('token', TOKEN);
+        showApp();
+      } catch (err) {
+        errorBox.textContent = 'Could not reach server';
+      }
+    }
+
+    function logout() {
+      localStorage.removeItem('token');
+      location.reload();
+    }
+
+    function authHeaders() {
+      return { Authorization: 'Bearer ' + TOKEN };
+    }
+
+    async function addSymbol() {
+      const input = document.getElementById('symbolInput');
+      const symbol = input.value.trim().toUpperCase();
+      if (!symbol) return;
+      await fetch('/watchlist', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ symbol }),
+      });
+      input.value = '';
+      loadChanges(false);
+    }
+
+    async function removeSymbol(symbol) {
+      await fetch(`/watchlist/${symbol}`, { method: 'DELETE', headers: authHeaders() });
+      loadChanges(false);
+    }
+
+    async function loadChanges(markViewed) {
+      const res = await fetch(`/watchlist/changes?mark_viewed=${markViewed}`, {
+        headers: authHeaders(),
+      });
+      if (res.status === 401) {
+        // Token expired or invalid — send back to login
+        localStorage.removeItem('token');
+        location.reload();
+        return;
+      }
+      const data = await res.json();
+      const list = document.getElementById('list');
+      list.innerHTML = '';
+
+      data.forEach((item) => {
+        const div = document.createElement('div');
+        div.className = 'row' + (item.meaningful ? ' meaningful' : '');
+
+        const pct = item.pct_change ? parseFloat(item.pct_change) : 0;
+        const direction = pct > 0 ? 'up' : pct < 0 ? 'down' : '';
+
+        div.innerHTML = `
+          <div>
+            <div class="symbol">${item.symbol}</div>
+            <div class="reason">${item.reason || item.status || ''}</div>
+          </div>
+          <div style="text-align:right">
+            <div class="price ${direction}">${item.current_price ?? '—'} ${item.pct_change ? `(${item.pct_change})` : ''}</div>
+            <button onclick="removeSymbol('${item.symbol}')">Remove</button>
+          </div>
+        `;
+        list.appendChild(div);
+      });
+    }
+  </script>
+</body>
+</html>
