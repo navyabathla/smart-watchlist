@@ -1,13 +1,13 @@
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
-const { getQuote } = require('./finnhub');
 
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
 const pool = require('./db');
 const redis = require('./redis');
+const { getQuote } = require('./finnhub');
 
 const app = express();
 app.use(cors());
@@ -166,21 +166,50 @@ app.get('/watchlist/changes', requireAuth, async (req, res) => {
       [user_id]
     );
 
+    const symbolList = watchlist.rows.map((r) => r.symbol);
+
+    // Batched volatility lookup — ONE query for every watched symbol instead of one per symbol (fixes N+1)
+    const volMap = {};
+    if (symbolList.length > 0) {
+      const volAllRes = await pool.query(
+        `SELECT symbol, STDDEV(price) AS vol, AVG(price) AS avg_price, COUNT(*) AS n
+         FROM (
+           SELECT symbol, price,
+                  ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY time DESC) AS rn
+           FROM price_snapshots
+           WHERE symbol = ANY($1)
+         ) sub
+         WHERE rn <= 20
+         GROUP BY symbol`,
+        [symbolList]
+      );
+      volAllRes.rows.forEach((r) => {
+        volMap[r.symbol] = r;
+      });
+    }
+
     const results = [];
 
     for (const item of watchlist.rows) {
       const { symbol, last_viewed_at } = item;
 
-      const latestRes = await pool.query(
-        'SELECT price, time FROM price_snapshots WHERE symbol = $1 ORDER BY time DESC LIMIT 1',
-        [symbol]
-      );
-      if (latestRes.rows.length === 0) {
-        results.push({ symbol, status: 'no_data_yet' });
-        continue;
+      // Current price: check Redis cache first (populated by the poller), fall back to Postgres on a miss
+      let currentPrice = await redis.get(`latest_price:${symbol}`);
+      if (currentPrice !== null) {
+        currentPrice = parseFloat(currentPrice);
+      } else {
+        const latestRes = await pool.query(
+          'SELECT price FROM price_snapshots WHERE symbol = $1 ORDER BY time DESC LIMIT 1',
+          [symbol]
+        );
+        if (latestRes.rows.length === 0) {
+          results.push({ symbol, status: 'no_data_yet' });
+          continue;
+        }
+        currentPrice = parseFloat(latestRes.rows[0].price);
       }
-      const current = latestRes.rows[0];
 
+      // First snapshot recorded AFTER the user's last visit — our baseline
       const baselineRes = await pool.query(
         `SELECT price, time FROM price_snapshots
          WHERE symbol = $1 AND time >= $2
@@ -191,7 +220,7 @@ app.get('/watchlist/changes', requireAuth, async (req, res) => {
       if (baselineRes.rows.length === 0) {
         results.push({
           symbol,
-          current_price: current.price,
+          current_price: currentPrice,
           status: 'no_new_data_since_last_visit',
           meaningful: false,
         });
@@ -199,20 +228,16 @@ app.get('/watchlist/changes', requireAuth, async (req, res) => {
       }
 
       const baseline = baselineRes.rows[0];
-      const pctChange = (current.price - baseline.price) / baseline.price;
+      const pctChange = (currentPrice - baseline.price) / baseline.price;
 
-      const volRes = await pool.query(
-        `SELECT STDDEV(price) AS vol, AVG(price) AS avg_price, COUNT(*) AS n
-         FROM (SELECT price FROM price_snapshots WHERE symbol = $1 ORDER BY time DESC LIMIT 20) sub`,
-        [symbol]
-      );
-      const { vol, avg_price, n } = volRes.rows[0];
+      const volRow = volMap[symbol] || {};
+      const { vol, avg_price, n } = volRow;
 
       let meaningful, reason;
 
-      if (n < 5 || vol == null || Number(avg_price) === 0) {
+      if (!n || n < 5 || vol == null || Number(avg_price) === 0) {
         meaningful = Math.abs(pctChange) > 0.01;
-        reason = `insufficient history (${n} points) — used flat 1% threshold`;
+        reason = `insufficient history (${n || 0} points) — used flat 1% threshold`;
       } else {
         const MIN_RELATIVE_VOL = 0.001;
         const relativeVol = Math.max(vol / avg_price, MIN_RELATIVE_VOL);
@@ -224,7 +249,7 @@ app.get('/watchlist/changes', requireAuth, async (req, res) => {
       results.push({
         symbol,
         baseline_price: baseline.price,
-        current_price: current.price,
+        current_price: currentPrice,
         pct_change: (pctChange * 100).toFixed(2) + '%',
         meaningful,
         reason,
@@ -244,7 +269,8 @@ app.get('/watchlist/changes', requireAuth, async (req, res) => {
     res.status(500).json({ error: 'Failed to compute changes' });
   }
 });
-// --- In-process price polling (merged from worker.js — see README for why) ---
+
+// --- In-process price polling (merged from worker.js — free-tier workers require a paid Render plan) ---
 const POLL_INTERVAL_MS = 60 * 1000;
 
 async function getWatchedSymbols() {
@@ -260,10 +286,15 @@ async function pollOnce() {
     try {
       const quote = await getQuote(symbol);
       if (quote.price == null) continue;
+
       await pool.query(
         'INSERT INTO price_snapshots (symbol, price) VALUES ($1, $2)',
         [symbol, quote.price]
       );
+
+      // Cache the latest price so /watchlist/changes can skip a Postgres query per request.
+      await redis.set(`latest_price:${symbol}`, quote.price, 'EX', 90);
+
       console.log(`Stored ${symbol}: $${quote.price}`);
     } catch (err) {
       console.error(`Failed to fetch/store ${symbol}:`, err.message);
