@@ -20,7 +20,7 @@ Most watchlists show you a price and a percent change. That's not the same as kn
 │ Finnhub API │
 └─────────────┘
 
-Redis (Render Key Value / Valkey) is provisioned for caching, alongside the core Postgres + Express path used for the current feature set.
+Redis (Render Key Value / Valkey) caches each symbol's latest price after every poll, so repeated requests for the same symbol — including from many users watching the same stock — are served from cache instead of hitting Postgres each time.
 
 ## Why these technologies, over the alternatives considered
 
@@ -37,12 +37,15 @@ For each watched symbol, on every check:
 3. Score the price move as a multiple of that stock's own normal volatility (a z-score), not a flat percentage.
 4. Flag it as meaningful only if the move is a statistically unusual multiple (>1.5x) of what's normal for that specific stock.
 5. Cold-start fallback: if a symbol has fewer than 5 snapshots, fall back to a flat 1% threshold until real history accumulates.
+6. Volatility for every watched symbol is computed in a single batched query per request, not one query per symbol — this was a real N+1 pattern in an earlier version, fixed once the scaling implications became clear.
 
 **A real bug caught and fixed during development:** during a closed-market period, flat repeated prices drove measured volatility toward zero, which meant even a tiny real price move produced an absurd 70x+ significance score once the market reopened (small denominator, huge z-score). Fixed by flooring relative volatility at a realistic minimum (0.1%) — documented in code as `MIN_RELATIVE_VOL`.
 
 ## Known limitations / trade-offs (honest, not hidden)
 
 - **Worker merged in-process:** Render's free tier doesn't support Background Worker services, so the price-polling loop runs inside the same process as the API server rather than as an isolated service. At real production scale, these would be split for independent scaling and fault isolation.
+- **Change-detection query complexity:** an earlier version ran one volatility query per watched symbol (N+1) inside the change-detection endpoint. This was batched into a single grouped query across all symbols per request — a concrete answer to the brief's "how does this scale for larger watchlists" question, not just a discussion of it.
+- **Conflicting updates across devices:** `last_viewed_at` uses last-write-wins semantics if two devices/tabs are open simultaneously — acceptable for this scope, but a production version would need per-device viewed timestamps rather than one shared field per user.
 - **Free-tier cold starts:** the hosted instance sleeps after 15 minutes of inactivity; the first request afterward is slow.
 - **Finnhub free tier has no volume data** on the `/quote` endpoint, so the change-detection scoring uses price/volatility only, not volume spikes.
 - **Single symbol source, no failover** — if Finnhub has an outage, snapshots simply stop until it recovers (handled gracefully, logged, doesn't crash the app).
